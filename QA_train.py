@@ -1,0 +1,758 @@
+import queue
+from numpy.random import shuffle
+
+import argparse
+import collections
+import logging
+import json
+import math
+import os
+import random
+import pickle
+from tqdm import tqdm, trange
+from qa_bert_based import *
+import numpy as np
+import torch
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data.distributed import DistributedSampler
+
+from pytorch_pretrained_bert.tokenization import whitespace_tokenize, BasicTokenizer, BertTokenizer
+from pytorch_pretrained_bert.modeling import BertForQuestionAnswering, BertForQuestionAnswering1, BertForQuestionAnswering2
+from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
+from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
+from util import evaluate
+from config import set_config
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.INFO)
+logger = logging.getLogger(__name__)
+IGNORE_INDEX = -100
+
+
+def _improve_answer_span(doc_tokens, input_start, input_end, tokenizer,
+                         orig_answer_text):
+    """Returns tokenized answer spans that better match the annotated answer."""
+
+    # The SQuAD annotations are character based. We first project them to
+    # whitespace-tokenized words. But then after WordPiece tokenization, we can
+    # often find a "better match". For example:
+    #
+    #   Question: What year was John Smith born?
+    #   Context: The leader was John Smith (1895-1943).
+    #   Answer: 1895
+    #
+    # The original whitespace-tokenized answer will be "(1895-1943).". However
+    # after tokenization, our tokens will be "( 1895 - 1943 ) .". So we can match
+    # the exact answer, 1895.
+    #
+    # However, this is not always possible. Consider the following:
+    #
+    #   Question: What country is the top exporter of electornics?
+    #   Context: The Japanese electronics industry is the lagest in the world.
+    #   Answer: Japan
+    #
+    # In this case, the annotator chose "Japan" as a character sub-span of
+    # the word "Japanese". Since our WordPiece tokenizer does not split
+    # "Japanese", we just use "Japanese" as the annotation. This is fairly rare
+    # in SQuAD, but does happen.
+    tok_answer_text = " ".join(tokenizer.tokenize(orig_answer_text))
+
+    for new_start in range(input_start, input_end + 1):
+        for new_end in range(input_end, new_start - 1, -1):
+            text_span = " ".join(doc_tokens[new_start:(new_end + 1)])
+            if text_span == tok_answer_text:
+                return (new_start, new_end)
+
+    return (input_start, input_end)
+
+
+def _check_is_max_context(doc_spans, cur_span_index, position):
+    """Check if this is the 'max context' doc span for the token."""
+
+    # Because of the sliding window approach taken to scoring documents, a single
+    # token can appear in multiple documents. E.g.
+    #  Doc: the man went to the store and bought a gallon of milk
+    #  Span A: the man went to the
+    #  Span B: to the store and bought
+    #  Span C: and bought a gallon of
+    #  ...
+    #
+    # Now the word 'bought' will have two scores from spans B and C. We only
+    # want to consider the score with "maximum context", which we define as
+    # the *minimum* of its left and right context (the *sum* of left and
+    # right context will always be the same, of course).
+    #
+    # In the example the maximum context for 'bought' would be span C since
+    # it has 1 left context and 3 right context, while span B has 4 left context
+    # and 0 right context.
+    best_score = None
+    best_span_index = None
+    for (span_index, doc_span) in enumerate(doc_spans):
+        end = doc_span.start + doc_span.length - 1
+        if position < doc_span.start:
+            continue
+        if position > end:
+            continue
+        num_left_context = position - doc_span.start
+        num_right_context = end - position
+        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
+        if best_score is None or score > best_score:
+            best_score = score
+            best_span_index = span_index
+
+    return cur_span_index == best_span_index
+
+
+RawResult = collections.namedtuple("RawResult",
+                                   ["unique_id", "start_logits", "end_logits", "types"])
+
+
+def write_predictions(all_examples, all_features, all_results, n_best_size,
+                      max_answer_length, do_lower_case, output_prediction_file,
+                      output_nbest_file, output_null_log_odds_file, verbose_logging,
+                      version_2_with_negative, null_score_diff_threshold):
+    """Write final predictions to the json file and log-odds of null if needed."""
+    logger.info("Writing predictions to: %s" % (output_prediction_file))
+    logger.info("Writing nbest to: %s" % (output_nbest_file))
+
+    example_index_to_features = collections.defaultdict(list)
+    for feature in all_features:
+        example_index_to_features[feature.example_index].append(feature)
+
+    unique_id_to_result = {}
+    for result in all_results:
+        unique_id_to_result[result.unique_id] = result
+
+    _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+        "PrelimPrediction",
+        ["feature_index", "start_index", "end_index", "start_logit", "end_logit", "type"])
+
+    all_predictions = collections.OrderedDict()
+    all_nbest_json = collections.OrderedDict()
+    scores_diff_json = collections.OrderedDict()
+
+    for (example_index, example) in enumerate(all_examples):
+        features = example_index_to_features[example_index]
+
+        prelim_predictions = []
+        # keep track of the minimum score of null start+end of position 0
+        score_null = 1000000  # large and positive
+        min_null_feature_index = 0  # the paragraph slice with min mull score
+        null_start_logit = 0  # the start logit at the slice with min null score
+        null_end_logit = 0  # the end logit at the slice with min null score
+        for (feature_index, feature) in enumerate(features):
+            result = unique_id_to_result[feature.unique_id]
+            for i in range(3):
+                start_indexes = _get_best_indexes(result.start_logits[i], n_best_size)
+                end_indexes = _get_best_indexes(result.end_logits[i], n_best_size)
+                # if we could have irrelevant answers, get the min score of irrelevant
+                if version_2_with_negative:
+                    feature_null_score = result.start_logits[i][0] + result.end_logits[i][0]
+                    if feature_null_score < score_null:
+                        score_null = feature_null_score
+                        min_null_feature_index = feature_index
+                        null_start_logit = result.start_logits[0][i]
+                        null_end_logit = result.end_logits[0][i]
+                for start_index in start_indexes:
+                    for end_index in end_indexes:
+                        # We could hypothetically create invalid predictions, e.g., predict
+                        # that the start of the span is in the question. We throw out all
+                        # invalid predictions.
+                        if start_index >= len(feature.tokens):
+                            continue
+                        if end_index >= len(feature.tokens):
+                            continue
+                        if start_index not in feature.token_to_orig_map:
+                            continue
+                        if end_index not in feature.token_to_orig_map:
+                            continue
+                        # if not feature.token_is_max_context.get(start_index, False):
+                        #     continue
+                        if end_index < start_index:
+                            continue
+                        length = end_index - start_index + 1
+                        if length > max_answer_length:
+                            continue
+                        prelim_predictions.append(
+                            _PrelimPrediction(
+                                feature_index=feature_index,
+                                start_index=start_index,
+                                end_index=end_index,
+                                start_logit=result.start_logits[i][start_index],
+                                end_logit=result.end_logits[i][end_index],
+                                type=result.types))
+        if version_2_with_negative:
+            prelim_predictions.append(
+                _PrelimPrediction(
+                    feature_index=min_null_feature_index,
+                    start_index=0,
+                    end_index=0,
+                    start_logit=null_start_logit,
+                    end_logit=null_end_logit,
+                    type=0))
+        prelim_predictions = sorted(
+            prelim_predictions,
+            key=lambda x: (x.start_logit + x.end_logit),
+            reverse=True)
+
+        _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+            "NbestPrediction", ["text", "start_logit", "end_logit", "type"])
+
+        seen_predictions = {}
+        nbest = []
+        for pred in prelim_predictions:
+            if len(nbest) >= n_best_size:
+                break
+            feature = features[pred.feature_index]
+            if pred.type == 0:
+                if pred.start_index > 0:  # this is a non-null prediction
+                    tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+                    orig_doc_start = feature.token_to_orig_map[pred.start_index]
+                    orig_doc_end = feature.token_to_orig_map[pred.end_index]
+                    orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+                    tok_text = " ".join(tok_tokens)
+
+                    # De-tokenize WordPieces that have been split off.
+                    tok_text = tok_text.replace(" ##", "")
+                    tok_text = tok_text.replace("##", "")
+
+                    # Clean whitespace
+                    tok_text = tok_text.strip()
+                    tok_text = " ".join(tok_text.split())
+                    orig_text = " ".join(orig_tokens)
+
+                    final_text = get_final_text(tok_text, orig_text, do_lower_case, verbose_logging)
+                    if final_text in seen_predictions:
+                        continue
+
+                    seen_predictions[final_text] = True
+                else:
+                    final_text = ""
+                    seen_predictions[final_text] = True
+            if pred.type == 1:
+                final_text = "yes"
+            if pred.type == 2:
+                final_text = "no"
+            nbest.append(
+                _NbestPrediction(
+                    text=final_text,
+                    start_logit=pred.start_logit,
+                    end_logit=pred.end_logit,
+                    type=pred.type,
+                    ))
+        # if we didn't include the empty option in the n-best, include it
+        if version_2_with_negative:
+            if "" not in seen_predictions:
+                nbest.append(
+                    _NbestPrediction(
+                        text="",
+                        start_logit=null_start_logit,
+                        end_logit=null_end_logit,
+                        type=0))
+
+            # In very rare edge cases we could only have single null prediction.
+            # So we just create a nonce prediction in this case to avoid failure.
+            if len(nbest) == 1:
+                nbest.insert(
+                    0,
+                    _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0, type=0)
+                )
+
+        # In very rare edge cases we could have no valid predictions. So we
+        # just create a nonce prediction in this case to avoid failure.
+        if not nbest:
+            nbest.append(
+                _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0, type=0))
+
+        assert len(nbest) >= 1
+
+        total_scores = []
+        best_non_null_entry = None
+        for entry in nbest:
+            total_scores.append(entry.start_logit + entry.end_logit)
+            if not best_non_null_entry:
+                if entry.text:
+                    best_non_null_entry = entry
+
+        probs = _compute_softmax(total_scores)
+
+        nbest_json = []
+        for (i, entry) in enumerate(nbest):
+            output = collections.OrderedDict()
+            output["text"] = entry.text
+            output["probability"] = probs[i]
+            output["start_logit"] = entry.start_logit
+            output["end_logit"] = entry.end_logit
+            output["type"] = entry.type
+            nbest_json.append(output)
+        assert len(nbest_json) >= 1
+        if not version_2_with_negative:
+            all_predictions[example.qas_id] = nbest_json[0]["text"]
+
+        else:
+            # predict "" iff the null score - the score of best non-null > threshold
+            score_diff = score_null - best_non_null_entry.start_logit - (
+                best_non_null_entry.end_logit)
+            scores_diff_json[example.qas_id] = score_diff
+            if score_diff > null_score_diff_threshold:
+                all_predictions[example.qas_id] = ""
+            else:
+                all_predictions[example.qas_id] = best_non_null_entry.text
+                all_nbest_json[example.qas_id] = nbest_json
+    with open(output_prediction_file, "w") as writer:
+        writer.write(json.dumps(all_predictions, indent=4) + "\n")
+    with open(output_nbest_file, "w") as writer:
+        writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
+
+    if version_2_with_negative:
+        with open(output_null_log_odds_file, "w") as writer:
+            writer.write(json.dumps(scores_diff_json, indent=4) + "\n")
+
+    return all_predictions
+
+def get_final_text(pred_text, orig_text, do_lower_case, verbose_logging=False):
+    """Project the tokenized prediction back to the original text."""
+
+    # When we created the data, we kept track of the alignment between original
+    # (whitespace tokenized) tokens and our WordPiece tokenized tokens. So
+    # now `orig_text` contains the span of our original text corresponding to the
+    # span that we predicted.
+    #
+    # However, `orig_text` may contain extra characters that we don't want in
+    # our prediction.
+    #
+    # For example, let's say:
+    #   pred_text = steve smith
+    #   orig_text = Steve Smith's
+    #
+    # We don't want to return `orig_text` because it contains the extra "'s".
+    #
+    # We don't want to return `pred_text` because it's already been normalized
+    # (the SQuAD eval script also does punctuation stripping/lower casing but
+    # our tokenizer does additional normalization like stripping accent
+    # characters).
+    #
+    # What we really want to return is "Steve Smith".
+    #
+    # Therefore, we have to apply a semi-complicated alignment heruistic between
+    # `pred_text` and `orig_text` to get a character-to-charcter alignment. This
+    # can fail in certain cases in which case we just return `orig_text`.
+
+    def _strip_spaces(text):
+        ns_chars = []
+        ns_to_s_map = collections.OrderedDict()
+        for (i, c) in enumerate(text):
+            if c == " ":
+                continue
+            ns_to_s_map[len(ns_chars)] = i
+            ns_chars.append(c)
+        ns_text = "".join(ns_chars)
+        return (ns_text, ns_to_s_map)
+
+    # We first tokenize `orig_text`, strip whitespace from the result
+    # and `pred_text`, and check if they are the same length. If they are
+    # NOT the same length, the heuristic has failed. If they are the same
+    # length, we assume the characters are one-to-one aligned.
+    tokenizer = BasicTokenizer(do_lower_case=do_lower_case)
+
+    tok_text = " ".join(tokenizer.tokenize(orig_text))
+
+    start_position = tok_text.find(pred_text)
+    if start_position == -1:
+        if verbose_logging:
+            logger.info(
+                "Unable to find text: '%s' in '%s'" % (pred_text, orig_text))
+        return orig_text
+    end_position = start_position + len(pred_text) - 1
+
+    (orig_ns_text, orig_ns_to_s_map) = _strip_spaces(orig_text)
+    (tok_ns_text, tok_ns_to_s_map) = _strip_spaces(tok_text)
+
+    if len(orig_ns_text) != len(tok_ns_text):
+        if verbose_logging:
+            logger.info("Length not equal after stripping spaces: '%s' vs '%s'",
+                        orig_ns_text, tok_ns_text)
+        return orig_text
+
+    # We then project the characters in `pred_text` back to `orig_text` using
+    # the character-to-character alignment.
+    tok_s_to_ns_map = {}
+    for (i, tok_index) in tok_ns_to_s_map.items():
+        tok_s_to_ns_map[tok_index] = i
+
+    orig_start_position = None
+    if start_position in tok_s_to_ns_map:
+        ns_start_position = tok_s_to_ns_map[start_position]
+        if ns_start_position in orig_ns_to_s_map:
+            orig_start_position = orig_ns_to_s_map[ns_start_position]
+
+    if orig_start_position is None:
+        if verbose_logging:
+            logger.info("Couldn't map start position")
+        return orig_text
+
+    orig_end_position = None
+    if end_position in tok_s_to_ns_map:
+        ns_end_position = tok_s_to_ns_map[end_position]
+        if ns_end_position in orig_ns_to_s_map:
+            orig_end_position = orig_ns_to_s_map[ns_end_position]
+
+    if orig_end_position is None:
+        if verbose_logging:
+            logger.info("Couldn't map end position")
+        return orig_text
+
+    output_text = orig_text[orig_start_position:(orig_end_position + 1)]
+    return output_text
+
+def _get_best_indexes(logits, n_best_size):
+    """Get the n-best logits from a list."""
+    index_and_score = sorted(enumerate(logits), key=lambda x: x[1], reverse=True)
+
+    best_indexes = []
+    for i in range(len(index_and_score)):
+        if i >= n_best_size:
+            break
+        best_indexes.append(index_and_score[i][0])
+    return best_indexes
+
+def _compute_softmax(scores):
+    """Compute softmax probability over raw logits."""
+    if not scores:
+        return []
+
+    max_score = None
+    for score in scores:
+        if max_score is None or score > max_score:
+            max_score = score
+
+    exp_scores = []
+    total_sum = 0.0
+    for score in scores:
+        x = math.exp(score - max_score)
+        exp_scores.append(x)
+        total_sum += x
+
+    probs = []
+    for score in exp_scores:
+        probs.append(score / total_sum)
+    return probs
+
+def convert_to_tokens(example, features, ids, y1, y2, q_type):
+    answer_dict = dict()
+    for i, qid in enumerate(ids):
+        answer_text = ''
+        if q_type[i] == 0:
+            doc_tokens = features[qid].doc_tokens
+            tok_tokens = doc_tokens[y1[i]: y2[i] + 1]
+            tok_to_orig_map = features[qid].token_to_orig_map
+            if y2[i] < len(tok_to_orig_map):
+                orig_doc_start = tok_to_orig_map[y1[i]]
+                orig_doc_end = tok_to_orig_map[y2[i]]
+                orig_tokens = example[qid].doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+                tok_text = " ".join(tok_tokens)
+
+                # De-tokenize WordPieces that have been split off.
+                tok_text = tok_text.replace(" ##", "")
+                tok_text = tok_text.replace("##", "")
+
+                # Clean whitespace
+                tok_text = tok_text.strip()
+                tok_text = " ".join(tok_text.split())
+                orig_text = " ".join(orig_tokens).strip('[,.;]')
+
+                final_text = get_final_text(tok_text, orig_text, do_lower_case=False, verbose_logging=False)
+                answer_text = final_text
+        elif q_type[i] == 1:
+            answer_text = 'yes'
+        elif q_type[i] == 2:
+            answer_text = 'no'
+        answer_dict[qid] = answer_text
+    return answer_dict
+
+class DataIteratorPack(object):
+    def __init__(self, features, example_dict, bsz, device, sent_limit, sequential=False,):
+        self.bsz = bsz
+        self.device = device
+        self.features = features
+        self.example_dict = example_dict
+        self.sequential = sequential
+        self.sent_limit = sent_limit
+        self.example_ptr = 0
+        if not sequential:
+            shuffle(self.features)
+
+    def refresh(self):
+        self.example_ptr = 0
+        if not self.sequential:
+            shuffle(self.features)
+
+    def empty(self):
+        return self.example_ptr >= len(self.features)
+
+    def __len__(self):
+        return int(np.ceil(len(self.features)/self.bsz))
+
+    def __iter__(self):
+        # BERT input
+        context_idxs = torch.LongTensor(self.bsz, 512).cuda(self.device)
+        context_mask = torch.LongTensor(self.bsz, 512).cuda(self.device)
+        segment_idxs = torch.LongTensor(self.bsz, 512).cuda(self.device)
+
+        # Label tensor
+        y1 = torch.LongTensor(self.bsz).cuda(self.device)
+        y2 = torch.LongTensor(self.bsz).cuda(self.device)
+        q_type = torch.LongTensor(self.bsz).cuda(self.device)
+        # is_support = torch.FloatTensor(self.bsz, self.sent_limit).cuda(self.device)
+
+
+
+        while True:
+            if self.example_ptr >= len(self.features):
+                break
+            start_id = self.example_ptr
+            cur_bsz = min(self.bsz, len(self.features) - start_id)
+            cur_batch = self.features[start_id: start_id + cur_bsz]
+            cur_batch.sort(key=lambda x: sum(x.doc_input_mask), reverse=True)
+
+
+            # is_support.fill_(IGNORE_INDEX)
+            # is_support.fill_(0)  # BCE
+
+            for i in range(len(cur_batch)):
+                case = cur_batch[i]
+                context_idxs[i].copy_(torch.Tensor(case.doc_input_ids))
+                context_mask[i].copy_(torch.Tensor(case.doc_input_mask))
+                segment_idxs[i].copy_(torch.Tensor(case.doc_segment_ids))
+
+                if case.ans_type == 0:
+                    if len(case.end_position) == 0:
+                        y1[i] = y2[i] = 0
+                    elif case.end_position[0] < 512:
+                        y1[i] = case.start_position[0]
+                        y2[i] = case.end_position[0]
+                    else:
+                        y1[i] = y2[i] = 0
+                    q_type[i] = 0
+                elif case.ans_type == 1:
+                    y1[i] = IGNORE_INDEX
+                    y2[i] = IGNORE_INDEX
+                    q_type[i] = 1
+                elif case.ans_type == 2:
+                    y1[i] = IGNORE_INDEX
+                    y2[i] = IGNORE_INDEX
+                    q_type[i] = 2
+
+                # for j, sent_span in enumerate(case.sent_spans[:self.sent_limit]):
+                #     is_sp_flag = j in case.sup_fact_ids
+                #     start, end = sent_span
+                #     if start < end:
+                #         is_support[i, j] = int(is_sp_flag)
+
+
+
+
+
+            input_lengths = (context_mask[:cur_bsz] > 0).long().sum(dim=1)
+            max_c_len = int(input_lengths.max())
+
+            self.example_ptr += cur_bsz
+
+            yield {
+                'context_idxs': context_idxs[:cur_bsz, :max_c_len].contiguous(),
+                'context_mask': context_mask[:cur_bsz, :max_c_len].contiguous(),
+                'segment_idxs': segment_idxs[:cur_bsz, :max_c_len].contiguous(),
+                # 'context_lens': input_lengths.to(self.device),
+                'y1': y1[:cur_bsz],
+                'y2': y2[:cur_bsz],
+                'q_type': q_type[:cur_bsz],
+                # 'is_support': is_support[:cur_bsz, :max_sent_cnt].contiguous(),
+            }
+
+
+def example_dict(examples):
+
+    return {e.qas_id: e for e in examples}
+
+def get_pickle_file(file_name):
+    if "gz" in  file_name:
+        return gzip.open(file_name, 'rb')
+    else:
+        return open(file_name, 'rb')
+
+def get_or_load(file):
+    with get_pickle_file(file) as fin:
+        return pickle.load(fin)
+
+def get_train_feature(args, is_train, tokenizer):
+    data_file = args.train_file if is_train else args.predict_file
+    examples_file = args.train_examples_file if is_train else args.predict_examples_file
+    features_file = args.train_features_file if is_train else args.predict_features_file
+    if not os.path.exists(examples_file):
+        train_examples = read_hotpot_examples(data_file, is_train)
+        train_features = convert_examples_to_features(train_examples, tokenizer, max_seq_length=512,
+                                                      max_query_length=64)
+        with gzip.open(examples_file, 'wb') as fout:
+            pickle.dump(train_examples, fout)
+        with gzip.open(features_file, 'wb') as fout:
+            pickle.dump(train_features, fout)
+        # pickle.dump(train_examples, gzip.open(examples_file, 'wb'))
+        # pickle.dump(train_features, gzip.open(features_file, 'wb'))
+    else:
+        train_examples = get_or_load(examples_file)
+        train_features = get_or_load(features_file)
+    return train_examples, train_features
+
+
+def main():
+    args = set_config()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+
+    # Prepare model
+    model = BertForQuestionAnswering2.from_pretrained(args.bert_model)
+    # model = BertForQuestionAnswering1.from_pretrained(args.bert_model)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # output_model_file = os.path.join(args.output_dir, "pytorch_model_{}.bin".format(0))
+    # model_state_dict = torch.load(output_model_file)
+    # model = BertForQuestionAnswering2.from_pretrained(args.bert_model, state_dict=model_state_dict)
+    model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    global_step = 0
+    if args.do_train:
+        # load train data
+        train_examples, train_features = get_train_feature(args, args.do_train, tokenizer)
+        train_data = DataIteratorPack(train_features, train_examples, args.train_batch_size, device, sent_limit=None,
+                                      sequential=False)
+        # train_example_dict = example_dict(train_examples)
+
+        # load dev data
+        eval_examples, eval_features = get_train_feature(args, not args.do_train, tokenizer)
+
+        logger.info("***** Running training *****")
+        logger.info("  Num split examples = %d", len(train_features))
+        logger.info("  Batch size = %d", args.train_batch_size)
+
+        total_train_loss = 0
+        VERBOSE_STEP = 100
+        grad_accumulate_step = 1
+        for epoch in trange(int(args.num_train_epochs), desc="Epoch"):
+            model.train()
+
+            # learning rate decay
+            # if epoch > 1:
+            #     args.learning_rate = args.learning_rate * args.decay
+            #     for param_group in optimizer.param_groups:
+            #         param_group['lr'] = args.learning_rate
+            #     print('lr = {}'.format(args.learning_rate))
+
+            for step, batch in enumerate(train_data):
+                # batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
+                input_ids = batch["context_idxs"]
+                input_mask = batch["context_mask"]
+                segment_ids = batch["segment_idxs"]
+                start_positions = batch["y1"]
+                end_positions = batch["y2"]
+                q_types = batch["q_type"]
+                loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions, q_types)
+
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                loss.backward()
+                if (global_step + 1) % grad_accumulate_step == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+
+                total_train_loss += loss
+                global_step += 1
+
+                if global_step % VERBOSE_STEP == 0:
+                    print("-- In Epoch{}: ".format(epoch))
+                    print("Avg-LOSS: {}/batch/step: {}".format(total_train_loss/VERBOSE_STEP, global_step/VERBOSE_STEP))
+                    total_train_loss = 0
+
+                # Save a trained model
+                model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+                output_model_file = os.path.join(args.output_dir, "pytorch_model_{}.bin".format(epoch))
+                if global_step % VERBOSE_STEP == 0:
+                    if args.do_train:
+                        torch.save(model_to_save.state_dict(), output_model_file)
+                        # Load a trained model that you have fine-tuned
+                        # model_state_dict = torch.load(output_model_file)
+                        # model = BertForQuestionAnswering.from_pretrained(args.bert_model, state_dict=model_state_dict)
+                    else:
+                        model = BertForQuestionAnswering.from_pretrained(args.bert_model)
+
+                        model.to(device)
+            train_data.refresh()
+            if args.do_predict:
+
+                eval_examples_dict = example_dict(eval_examples)
+                # eval_features_dict = example_dict(eval_features)
+
+                logger.info("***** Running predictions *****")
+                logger.info("  Num split examples = %d", len(eval_features))
+                logger.info("  Batch size = %d", args.predict_batch_size)
+
+                all_input_ids = torch.tensor([f.doc_input_ids for f in eval_features], dtype=torch.long)
+                all_input_mask = torch.tensor([f.doc_input_mask for f in eval_features], dtype=torch.long)
+                all_segment_ids = torch.tensor([f.doc_segment_ids for f in eval_features], dtype=torch.long)
+                all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
+                eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_example_index)
+                eval_sampler = SequentialSampler(eval_data)
+                eval_dataloader = DataLoader(eval_data, sampler=eval_sampler,
+                                             batch_size=args.predict_batch_size)
+
+                # eval_dataloader = DataIteratorPack(eval_features, eval_examples, args.train_batch_size, device, sent_limit=None,
+                #                               sequential=False)
+
+                model.eval()
+                all_results = []
+                logger.info("Start evaluating")
+                for input_ids, input_mask, segment_ids, example_indices in tqdm(eval_dataloader, desc="Evaluating"):
+                    if len(all_results) % 1000 == 0:
+                        logger.info("Processing example: %d" % (len(all_results)))
+                    input_ids = input_ids.to(device)
+                    input_mask = input_mask.to(device)
+                    segment_ids = segment_ids.to(device)
+                    with torch.no_grad():
+                        batch_start_logits, batch_end_logits, batch_types = model(input_ids, segment_ids, input_mask)
+                    for i, example_index in enumerate(example_indices):
+
+                        start_logits = [batch_start_logits[j][i].detach().cpu().tolist() for j in range(len((batch_start_logits)))]
+
+                        end_logits = [batch_end_logits[j][i].detach().cpu().tolist() for j in range(len((batch_end_logits)))]
+                        eval_feature = eval_features[example_index.item()]
+                        unique_id = int(eval_feature.unique_id)
+                        types = batch_types[i].detach().cpu().tolist()
+                        all_results.append(RawResult(unique_id=unique_id,
+                                                     start_logits=start_logits,
+                                                     end_logits=end_logits,
+                                                     types=types))
+
+                output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(epoch))
+                output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(epoch))
+                output_null_log_odds_file = os.path.join(args.output_dir, "null_odds_{}.json".format(epoch))
+                all_predictions = write_predictions(eval_examples, eval_features, all_results,
+                                  args.n_best_size, args.max_answer_length,
+                                  args.do_lower_case, output_prediction_file,
+                                  output_nbest_file, output_null_log_odds_file, args.verbose_logging,
+                                  args.version_2_with_negative, args.null_score_diff_threshold)
+
+                metrics = evaluate(eval_examples_dict, all_predictions)
+                print('epoch {:3d} | EM {:.4f} | F1 {:.4f}'.format(
+                        epoch, metrics['exact_match'], metrics['f1']))
+
+
+if __name__ == "__main__":
+    main()
+
+
